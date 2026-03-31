@@ -88,6 +88,13 @@
 - 非 Bash 错误不取消兄弟（读操作互相独立）
 - 进度消息立即 yield；结果消息按顺序缓冲
 
+**进阶：队列反死锁模式**（来源：`queueProcessor.ts`）
+在写操作排队时，Claude Code 用 `QueueProcessor` 确保串行队列不会因单个工具超时或异常而阻塞后续任务。核心策略：
+- 每个入队任务包装为 Promise + 超时守卫
+- 任务失败时自动 dequeue 并将错误封装为 `tool_result`，而非让整个队列挂起
+- 消费循环用 `while + shift` 而非事件驱动，避免事件丢失导致的静默死锁
+- 这是"读写分区"的工程完备性补充 — 分区解决并发模型，队列解决串行安全
+
 ---
 
 ## 原则 4：依赖注入要窄、要有工厂函数
@@ -142,6 +149,14 @@ function createStore<T>(initialState: T, onChange?: OnChange<T>): Store<T> {
 
 **原则**：每层状态的可变范围 ≤ 其生命周期。不跨层持有可变引用。
 
+**进阶：会话级成本状态机**（来源：`bootstrap/state.ts`、成本追踪逻辑）
+Claude Code 的费用追踪是"最小化状态管理"的典型延伸：
+- 用 `sessionCostUSD` / `totalCostUSD` 两个进程级变量追踪本次会话 + 累计成本
+- 通过 `addCost(input, output, cacheRead, cacheCreation, modelId)` 单一入口更新 — 所有模型调用汇聚到同一函数
+- 嵌套计费：子 Agent（Swarm/Coordinator）的成本汇总到父会话，使用 `AsyncLocalStorage` 传递上下文
+- 持久化到 session JSONL 文件 — 恢复会话时可续算
+- 关键约束：**只加不减** — 状态机单向递增，避免扣费导致的数据不一致
+
 ---
 
 ## 原则 6：Feature Flag 驱动的渐进式上线
@@ -166,6 +181,16 @@ const reactiveCompact = feature('REACTIVE_COMPACT')
 - 条件 require 保持类型安全（`as typeof import(...)`)
 
 **运行时 Flag 的快照**：`buildQueryConfig()` 在 query 入口处快照一次，避免循环内 flag 值变化导致行为不一致。
+
+**进阶：多源配置的分层合并策略**（来源：settings 解析逻辑）
+Feature Flag 之外，Claude Code 还有一套复杂的多源配置系统，体现了"渐进式覆盖"原则：
+- **解析顺序**（低优先级 → 高优先级）：默认值 → 全局 `~/.claude/settings.json` → 项目 `.claude/settings.json` → 环境变量 → CLI 参数
+- **合并策略**因字段而异：
+  - 列表型（`allowedTools`）：取并集 — 任一层级允许即可用
+  - 布尔型（`enableTelemetry`）：高优先级覆盖低优先级
+  - 对象型（`permissions`）：深合并，deny 优先于 allow
+- **安全约束**：管理员策略（MDM / 企业配置）拥有最高否决权，任何下游配置不能覆盖
+- 这与 Feature Flag 互补 — Flag 控制"功能是否存在"，配置控制"功能如何运行"
 
 ---
 
@@ -212,6 +237,18 @@ query() → yield* queryLoop()
 - 可以在任意点 `return` 终止整个链
 - `using` 声明确保资源清理（如 memory prefetch）
 
+**进阶：TC39 显式资源管理（`using` 声明）**
+Claude Code 大量使用了 `using` / `Symbol.dispose` 模式来管理流式生命周期中的资源：
+```typescript
+using prefetch = startMemoryPrefetch()  // 返回 Disposable
+// ... 使用 prefetch 结果 ...
+// 作用域结束时自动调用 prefetch[Symbol.dispose]()
+```
+- 每个需要清理的资源实现 `Disposable` 接口
+- 作用域退出（正常 return 或异常）时保证 dispose 被调用
+- 与 AsyncGenerator 配合：generator return 触发 finally → dispose 级联清理
+- 替代了 try/finally 的手动管理 — 不会因为提前 return 而遗漏清理
+
 **Withholding 模式**：对于可恢复的错误（如 `max_output_tokens`），先 withhold 不 yield 给上游，尝试内部恢复。恢复成功则错误对消费者透明。
 
 ---
@@ -237,6 +274,22 @@ query() → yield* queryLoop()
 - **Headless**：`shouldAvoidPermissionPrompts` 直接拒绝
 
 **关键设计**：`CanUseToolFn` 是一个统一接口，无论底层走哪条路径，上层代码只关心 `allow | deny | ask` 结果。
+
+**进阶案例 A：沙箱适配器的平台抽象**（来源：`sandbox-adapter.ts`）
+沙箱是权限的"执行兜底"。Claude Code 通过 `SandboxAdapter` 抽象层隔离平台差异：
+- macOS 使用 `sandbox-exec` + Seatbelt profile
+- Linux 使用 `landlock` LSM
+- Docker 容器场景禁用主机沙箱，依赖容器本身的隔离
+- 适配器统一暴露 `wrapCommand(cmd, opts) → string[]`，上层完全不感知平台细节
+- 沙箱与权限是互补层：权限决定"是否允许执行"，沙箱限制"执行的破坏半径"
+
+**进阶案例 B：远程输入安全管道**（来源：`processUserInput` 管道）
+当输入来自非本地来源（MCP、API、协调器）时，Claude Code 在权限检查前增加安全预处理：
+- 检测并标记 `inputSource`（local / remote / api）
+- 远程输入执行 prompt injection 检测
+- `remoteInputGuard` 对可疑输入降级权限（从 auto → ask）
+- 所有外部输入走 `sanitize → classify → gate` 三步管道，再进入正常的权限决策链
+- 这体现了"零信任边界" — 输入源不可信时，权限模型自动收紧
 
 ---
 
@@ -314,3 +367,12 @@ my-plugin/
 - SSRF 防护（`ssrfGuard.ts`）
 - 配置变量替换（不暴露原始密钥）
 - 启用/禁用状态管理
+
+**进阶：多 Agent 协调模式**（来源：Coordinator / Swarm runner）
+插件架构的高阶应用是多 Agent 协调。Claude Code 支持两种模式：
+- **Coordinator 模式**：主 Agent 分配子任务给 Sub-agent，子任务在独立的 queryLoop 中运行
+- **In-process Swarm**：通过 `AsyncLocalStorage` 在同一进程内运行多个 Agent 上下文，共享内存但隔离状态
+- 协调器本身也是一个 `Tool` — 符合"一切皆工具"的统一抽象
+- 子 Agent 的权限由父 Agent 的 `ToolPermissionContext` 约束 — 不能越权
+- 成本、消息、abort 信号通过 `AsyncLocalStorage` 上下文自动传递 — 无需手动透传
+- 这是渐进式信任的自然延伸 — 子 Agent 获得的信任不超过其父级

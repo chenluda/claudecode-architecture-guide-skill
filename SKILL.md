@@ -34,7 +34,7 @@ description: >-
 ### 第 2 步：阅读并应用参考资料
 
 - [architecture-principles.md](references/architecture-principles.md) — 12 条核心架构原则
-- [pattern-catalog.md](references/pattern-catalog.md) — 15 个可迁移设计模式
+- [pattern-catalog.md](references/pattern-catalog.md) — 18 个可迁移设计模式
 - [review-checklists.md](references/review-checklists.md) — 架构评审清单
 - [from-zero-blueprint.md](references/from-zero-blueprint.md) — **从零构建蓝图**（5 Phase 完整路径）
 - [migration-playbook.md](references/migration-playbook.md) — 现有系统迁移手册
